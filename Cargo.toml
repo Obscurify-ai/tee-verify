@@ -1,0 +1,53 @@
+[package]
+name = "obscurify-tee-verify"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+description = "Check that an Obscurify TEE reply came from an attested confidential-computing gateway"
+repository = "https://github.com/Obscurify-ai/tee-verify"
+readme = "README.md"
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[[bin]]
+name = "obscurify-tee-verify"
+required-features = ["cli"]
+
+[features]
+default = []
+# The wasm-bindgen export used by the web client (build-wasm.sh).
+wasm = ["dep:wasm-bindgen", "dep:wasm-bindgen-futures", "dep:serde-wasm-bindgen", "dep:js-sys", "getrandom/js"]
+# The command-line tool for API users.
+cli = ["dep:tokio", "dep:clap"]
+
+[dependencies]
+dcap-qvl = { version = "0.7.1", default-features = false, features = ["std", "rustcrypto", "default-x509"] }
+ed25519-dalek = { version = "2", default-features = false }
+getrandom = "0.2"
+hex = "0.4"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+
+wasm-bindgen = { version = "0.2", optional = true }
+wasm-bindgen-futures = { version = "0.4", optional = true }
+serde-wasm-bindgen = { version = "0.6", optional = true }
+js-sys = { version = "0.3", optional = true }
+
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"], optional = true }
+clap = { version = "4", features = ["derive", "env"], optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
+
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = ["-Oz", "--enable-bulk-memory", "--enable-nontrapping-float-to-int", "--enable-sign-ext", "--enable-mutable-globals", "--enable-reference-types", "--enable-multivalue"]
