@@ -3,6 +3,7 @@
 
 mod canonical;
 mod collateral;
+pub mod e2ee;
 #[cfg(feature = "wasm")]
 mod wasm;
 
@@ -40,6 +41,9 @@ pub struct Evidence {
     pub attestation_json: String,
     /// The 64-hex-character nonce the client sent with the attestation request.
     pub nonce: String,
+    /// Encrypted mode: the request in plain text, as [`e2ee::Session::encrypt_request`]
+    /// returned it. Adds the `request_bytes` check.
+    pub request: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Debug)]
@@ -74,8 +78,8 @@ pub enum Status {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct Check {
-    /// Stable id: reply_bytes, receipt_signature, nonce_binding, tdx_hardware,
-    /// gateway_code, approved_release, model_host.
+    /// Stable id: reply_bytes, request_bytes (Encrypted mode), receipt_signature,
+    /// nonce_binding, tdx_hardware, gateway_code, approved_release, model_host.
     pub id: &'static str,
     pub status: Status,
     pub label: &'static str,
@@ -258,6 +262,33 @@ pub async fn verify_with_client(
         })(),
     );
 
+    // 1b. Encrypted mode: the request the enclave decrypted is the one the client wrote.
+    if let Some(plain) = &evidence.request {
+        checks.push(
+            "request_bytes",
+            "The enclave received exactly the conversation you sent",
+            (|| {
+                let receipt = receipt.as_ref().map_err(|e| (Status::Fail, e.clone()))?;
+                let Some(received) = event("request.received") else {
+                    return fail("the receipt has no request.received event");
+                };
+                let model = receipt["model"].as_str().unwrap_or_default();
+                let Some(forwarded) = e2ee::request_as_forwarded(plain, model) else {
+                    return fail("the request you sent has no single model id to compare");
+                };
+                let expected = received["body_hash"].as_str().unwrap_or_default();
+                let actual = sha256_tagged(&forwarded);
+                if expected == actual {
+                    Ok(format!("your decrypted request for {model} hashes to {actual}"))
+                } else {
+                    fail(format!(
+                        "your request hashes to {actual}, the enclave received {expected}: a message was added, removed or changed"
+                    ))
+                }
+            })(),
+        );
+    }
+
     // The keyset the attestation publishes, used by checks 2 and 3.
     let keyset = attestation
         .as_ref()
@@ -308,10 +339,139 @@ pub async fn verify_with_client(
         })(),
     );
 
+    attestation_checks(
+        attestation.as_ref().ok(),
+        keyset.as_ref(),
+        Some(receipt.as_ref().map(|r| r["workload_keyset_digest"].as_str().unwrap_or_default())),
+        &evidence.nonce,
+        options,
+        http,
+        &mut report,
+        &mut checks,
+    )
+    .await;
+
+    // 7. The gateway verified the model host before sending your request.
+    checks.push(
+        "model_host",
+        "The gateway verified the model host's attestation",
+        (|| {
+            receipt.as_ref().map_err(|e| (Status::Fail, e.clone()))?;
+            let Some(upstream) = event("upstream.verified") else {
+                return fail("the receipt has no upstream.verified event");
+            };
+            report.upstream_session = upstream["session_id"].as_str().map(String::from);
+            report.upstream_model = upstream["model_id"].as_str().map(String::from);
+            if upstream["result"] != "verified" || upstream["required"] != true {
+                return fail(format!(
+                    "upstream result {}, required {}",
+                    upstream["result"], upstream["required"]
+                ));
+            }
+            Ok(format!(
+                "model {} verified, session {}",
+                report.upstream_model.clone().unwrap_or_default(),
+                report.upstream_session.clone().unwrap_or_default()
+            ))
+        })(),
+    );
+
+    report.verified = checks.0.iter().all(|c| match c.id {
+        "approved_release" => c.status != Status::Fail,
+        _ => c.status == Status::Pass,
+    });
+    report.checks = checks.0;
+    report
+}
+
+/// What [`verify_attestation`] found: the checks on the attestation report alone.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct AttestationReport {
+    /// True when every check passed (the release check may be unchecked).
+    pub verified: bool,
+    pub checks: Vec<Check>,
+    /// The gateway's attested secp256k1 encryption key (uncompressed, hex), only
+    /// when `verified`: what Encrypted mode encrypts to.
+    pub e2ee_public_key: Option<String>,
+    /// `sha256:` of the attested keyset; a reply's receipt must name the same.
+    pub keyset_digest: Option<String>,
+    pub tcb_status: Option<String>,
+    pub advisory_ids: Vec<String>,
+    pub compose_hash: Option<String>,
+    pub app_id: Option<String>,
+    pub os_image_hash: Option<String>,
+    pub source_repo: Option<String>,
+    pub source_commit: Option<String>,
+}
+
+/// Check an attestation report fetched with `nonce` before sending anything,
+/// and pick out the key Encrypted mode encrypts to. Runs `nonce_binding`,
+/// `tdx_hardware`, `gateway_code` and `approved_release` (checks 3 to 6) plus
+/// `e2ee_key`: the keyset offers a secp256k1 encryption key. A client must not
+/// encrypt to any key but the one returned here.
+pub async fn verify_attestation(attestation_json: &str, nonce: &str, options: &Options) -> AttestationReport {
+    let http = reqwest::Client::new();
+    let doc = parse_json(attestation_json, "attestation report");
+    let attestation = doc.as_ref().ok().map(|v| v.get("attestation").cloned().unwrap_or(Value::Null));
+    let keyset = attestation.as_ref().map(|a| a["workload_keyset"].clone()).filter(|k| k.is_object());
+    let mut report = Report::default();
+    let mut checks = Checks(Vec::new());
+    attestation_checks(
+        attestation.as_ref(),
+        keyset.as_ref(),
+        None,
+        nonce,
+        options,
+        &http,
+        &mut report,
+        &mut checks,
+    )
+    .await;
+    let key = keyset.as_ref().and_then(e2ee::keyset_e2ee_key);
+    checks.push(
+        "e2ee_key",
+        "The attested gateway offers an encryption key",
+        match &key {
+            Some(k) => Ok(format!("{} key {}…", e2ee::E2EE_ALGO, &k[..18])),
+            None => fail(format!("the attested keyset has no {} key", e2ee::E2EE_ALGO)),
+        },
+    );
+    let verified = checks.0.iter().all(|c| match c.id {
+        "approved_release" => c.status != Status::Fail,
+        _ => c.status == Status::Pass,
+    });
+    AttestationReport {
+        verified,
+        checks: checks.0,
+        e2ee_public_key: key.filter(|_| verified),
+        keyset_digest: keyset.as_ref().map(|k| sha256_tagged(&canonical(k))),
+        tcb_status: report.tcb_status,
+        advisory_ids: report.advisory_ids,
+        compose_hash: report.compose_hash,
+        app_id: report.app_id,
+        os_image_hash: report.os_image_hash,
+        source_repo: report.source_repo,
+        source_commit: report.source_commit,
+    }
+}
+
+/// Checks 3 to 6: the attestation report answers `nonce`, comes from genuine
+/// TDX hardware running the measured gateway, and that gateway is an approved
+/// release. `signed_digest`: the keyset digest a receipt names, when checking
+/// a reply (`Some(Err)` when the receipt is unreadable).
+#[allow(clippy::too_many_arguments)]
+async fn attestation_checks(
+    attestation: Option<&Value>,
+    keyset: Option<&Value>,
+    signed_digest: Option<Result<&str, &String>>,
+    nonce: &str,
+    options: &Options,
+    http: &reqwest::Client,
+    report: &mut Report,
+    checks: &mut Checks,
+) {
     // The quote, parsed (not yet verified).
     let raw_quote: Option<Vec<u8>> = attestation
-        .as_ref()
-        .ok()
         .and_then(|a| a["evidence"]["quote"].as_str())
         .and_then(hex_bytes);
     let quote: Option<Quote> = raw_quote.as_deref().and_then(|q| Quote::parse(q).ok());
@@ -321,18 +481,18 @@ pub async fn verify_with_client(
         "nonce_binding",
         "That key belongs to the attested machine, which answered your fresh nonce",
         (|| {
-            let receipt = receipt.as_ref().map_err(|e| (Status::Fail, e.clone()))?;
-            let Some(keyset) = &keyset else {
+            let Some(keyset) = keyset else {
                 return fail("the attestation report has no workload keyset");
             };
             let digest = sha256_tagged(&canonical(keyset));
-            let signed_digest = receipt["workload_keyset_digest"].as_str().unwrap_or_default();
-            if digest != signed_digest {
-                return fail(format!(
-                    "the attested keyset hashes to {digest}, the receipt names {signed_digest}"
-                ));
+            match signed_digest {
+                Some(Err(e)) => return fail(e.clone()),
+                Some(Ok(signed)) if signed != digest => {
+                    return fail(format!("the attested keyset hashes to {digest}, the receipt names {signed}"));
+                }
+                _ => {}
             }
-            let nonce = evidence.nonce.trim();
+            let nonce = nonce.trim();
             if nonce.len() != 64 || !nonce.bytes().all(|b| b.is_ascii_hexdigit()) {
                 return fail("the nonce must be 64 hex characters");
             }
@@ -362,7 +522,7 @@ pub async fn verify_with_client(
         let (Some(raw), Some(quote)) = (&raw_quote, &quote) else {
             return fail("the attestation report has no readable TDX quote");
         };
-        if attestation.as_ref().ok().and_then(|a| a["tee_type"].as_str()) != Some("tdx") {
+        if attestation.and_then(|a| a["tee_type"].as_str()) != Some("tdx") {
             return fail("the attestation isn't a TDX attestation");
         }
         let collateral = match collateral::fetch(http, &options.pccs_url, quote).await {
@@ -401,7 +561,9 @@ pub async fn verify_with_client(
         "gateway_code",
         "The gateway's measured code matches the configuration it publishes",
         (|| {
-            let att = attestation.as_ref().map_err(|e| (Status::Fail, (*e).clone()))?;
+            let Some(att) = attestation else {
+                return fail("the attestation report isn't valid JSON");
+            };
             let ev = &att["evidence"];
             let Some(log) = embedded(&ev["event_log"]).and_then(|l| l.as_array().cloned()) else {
                 return fail("the attestation has no event log");
@@ -507,35 +669,4 @@ pub async fn verify_with_client(
     .await;
     checks.push("approved_release", "That configuration is an approved gateway release", release);
 
-    // 7. The gateway verified the model host before sending your request.
-    checks.push(
-        "model_host",
-        "The gateway verified the model host's attestation",
-        (|| {
-            receipt.as_ref().map_err(|e| (Status::Fail, e.clone()))?;
-            let Some(upstream) = event("upstream.verified") else {
-                return fail("the receipt has no upstream.verified event");
-            };
-            report.upstream_session = upstream["session_id"].as_str().map(String::from);
-            report.upstream_model = upstream["model_id"].as_str().map(String::from);
-            if upstream["result"] != "verified" || upstream["required"] != true {
-                return fail(format!(
-                    "upstream result {}, required {}",
-                    upstream["result"], upstream["required"]
-                ));
-            }
-            Ok(format!(
-                "model {} verified, session {}",
-                report.upstream_model.clone().unwrap_or_default(),
-                report.upstream_session.clone().unwrap_or_default()
-            ))
-        })(),
-    );
-
-    report.verified = checks.0.iter().all(|c| match c.id {
-        "approved_release" => c.status != Status::Fail,
-        _ => c.status == Status::Pass,
-    });
-    report.checks = checks.0;
-    report
 }

@@ -19,7 +19,7 @@ default = []
 # The wasm-bindgen export used by the web client (build-wasm.sh).
 wasm = ["dep:wasm-bindgen", "dep:wasm-bindgen-futures", "dep:serde-wasm-bindgen", "dep:js-sys", "getrandom/js"]
 # The command-line tool for API users.
-cli = ["dep:tokio", "dep:clap"]
+cli = ["dep:tokio", "dep:clap", "dep:futures-util", "reqwest/stream"]
 
 [dependencies]
 dcap-qvl = { version = "0.7.1", default-features = false, features = ["std", "rustcrypto", "default-x509"] }
@@ -30,6 +30,9 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+k256 = { version = "0.13", default-features = false, features = ["arithmetic", "ecdh", "std"] }
+hkdf = "0.12"
+aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc"] }
 
 wasm-bindgen = { version = "0.2", optional = true }
 wasm-bindgen-futures = { version = "0.4", optional = true }
@@ -38,6 +41,7 @@ js-sys = { version = "0.3", optional = true }
 
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"], optional = true }
 clap = { version = "4", features = ["derive", "env"], optional = true }
+futures-util = { version = "0.3", default-features = false, optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

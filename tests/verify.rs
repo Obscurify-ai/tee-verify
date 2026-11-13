@@ -14,6 +14,7 @@ fn evidence() -> Evidence {
         receipt_json: String::from_utf8(fixture("receipt.json")).unwrap(),
         attestation_json: String::from_utf8(fixture("attestation.json")).unwrap(),
         nonce: String::from_utf8(fixture("nonce.txt")).unwrap(),
+        request: None,
     }
 }
 
@@ -142,6 +143,7 @@ async fn garbage_is_a_failure_not_a_panic() {
         receipt_json: "not json".into(),
         attestation_json: "{}".into(),
         nonce: "zz".into(),
+        request: None,
     };
     let report = verify(&e, &offline()).await;
     assert!(!report.verified);
