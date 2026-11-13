@@ -1,6 +1,6 @@
 //! The command-line tool's `check` path. Needs `--features cli`; the live
 //! ones also need the network (`-- --ignored`). `TEE_VERIFY_LIVE_DIR` may
-//! point at a directory saved by `run --save` (body.sse, receipt.json,
+//! point at a directory saved by `chat --save` (body.sse, receipt.json,
 //! attestation.json, nonce.txt) to check a freshly captured reply instead.
 #![cfg(feature = "cli")]
 

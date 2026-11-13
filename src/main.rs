@@ -18,8 +18,7 @@ use std::time::Duration;
     long_about = "Check that an Obscurify TEE reply came from an attested confidential-computing gateway.\n\n\
 `chat` sends a prompt end-to-end encrypted (Encrypted mode): it checks the gateway's\n\
 attestation, encrypts to its attested key, decrypts the answer and checks the receipt.\n\
-`run` sends a prompt to a TEE model with verification on and checks the reply.\n\
-`check` checks a reply you saved earlier.\n\n\
+`check` checks a reply you saved earlier (chat --save).\n\n\
 Exit status: 0 verified, 1 not verified, 2 usage or network error."
 )]
 struct Cli {
@@ -38,22 +37,6 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Send a prompt with "tee_verify": true, then fetch and check the receipt.
-    Run {
-        /// Obscurify API key (sk-obs1_...). Also read from OBSCURIFY_API_KEY.
-        #[arg(long, env = "OBSCURIFY_API_KEY", hide_env_values = true)]
-        api_key: String,
-        /// A TEE model id, e.g. tee/glm-5.3-flash.
-        #[arg(long)]
-        model: String,
-        #[arg(long)]
-        prompt: String,
-        #[arg(long, default_value = "https://obscurify.ai/v1")]
-        base: String,
-        /// Save the reply bytes, receipt, attestation and nonce in this directory.
-        #[arg(long)]
-        save: Option<PathBuf>,
-    },
     /// Encrypted mode: verify the gateway's attestation, encrypt the prompt to its
     /// attested key, stream and decrypt the answer, then check the receipt
     /// (including that the enclave got exactly the request you encrypted).
@@ -92,6 +75,9 @@ enum Command {
         /// The nonce sent with the attestation request (64 hex characters).
         #[arg(long)]
         nonce: String,
+        /// The plain request you encrypted (request.json from chat --save): adds the request check.
+        #[arg(long)]
+        request: Option<PathBuf>,
     },
 }
 
@@ -104,7 +90,14 @@ async fn main() -> ExitCode {
         now_secs: None,
     };
     let evidence = match cli.command {
-        Command::Check { body, receipt, attestation, nonce } => {
+        Command::Check { body, receipt, attestation, nonce, request } => {
+            let request = match request.map(|p| std::fs::read(&p).map_err(|e| format!("{}: {e}", p.display()))).transpose() {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("{e}");
+                    return ExitCode::from(2);
+                }
+            };
             let read = |p: &PathBuf| std::fs::read(p).map_err(|e| format!("{}: {e}", p.display()));
             match (read(&body), read(&receipt), read(&attestation)) {
                 (Ok(body), Ok(receipt), Ok(attestation)) => Evidence {
@@ -112,7 +105,7 @@ async fn main() -> ExitCode {
                     receipt_json: String::from_utf8_lossy(&receipt).into_owned(),
                     attestation_json: String::from_utf8_lossy(&attestation).into_owned(),
                     nonce,
-                    request: None,
+                    request,
                 },
                 (a, b, c) => {
                     for e in [a.err(), b.err(), c.err()].into_iter().flatten() {
@@ -136,22 +129,6 @@ async fn main() -> ExitCode {
                 Err(Refused(code, message)) => {
                     eprintln!("{message}");
                     return ExitCode::from(code);
-                }
-            }
-        }
-        Command::Run { api_key, model, prompt, base, save } => {
-            match fetch(&api_key, &model, &prompt, base.trim_end_matches('/')).await {
-                Ok(evidence) => {
-                    if let Some(dir) = save {
-                        if let Err(e) = save_evidence(&dir, &evidence) {
-                            eprintln!("couldn't save to {}: {e}", dir.display());
-                        }
-                    }
-                    evidence
-                }
-                Err(e) => {
-                    eprintln!("{e}");
-                    return ExitCode::from(2);
                 }
             }
         }
@@ -366,85 +343,6 @@ fn print_checks(checks: &[Check]) {
         println!("  [{mark}] {}", check.label);
         println!("         {}", check.detail);
     }
-}
-
-async fn fetch(api_key: &str, model: &str, prompt: &str, base: &str) -> Result<Evidence, String> {
-    let http = reqwest::Client::new();
-    let response = http
-        .post(format!("{base}/chat/completions"))
-        .bearer_auth(api_key)
-        .json(&serde_json::json!({
-            "model": model,
-            "stream": true,
-            "tee_verify": true,
-            "messages": [{"role": "user", "content": prompt}],
-        }))
-        .send()
-        .await
-        .map_err(|e| format!("couldn't reach {base}: {e}"))?;
-    let status = response.status();
-    let header = |name: &str| {
-        response
-            .headers()
-            .get(name)
-            .and_then(|v| v.to_str().ok())
-            .map(String::from)
-    };
-    let receipt_id = header("x-obscurify-tee-receipt");
-    let route = header("x-obscurify-tee-route");
-    let body = response
-        .bytes()
-        .await
-        .map_err(|e| format!("the reply was cut off: {e}"))?
-        .to_vec();
-    if !status.is_success() {
-        return Err(format!("HTTP {}: {}", status.as_u16(), String::from_utf8_lossy(&body)));
-    }
-    let receipt_id = receipt_id.ok_or("the reply has no X-Obscurify-TEE-Receipt header")?;
-
-    let get = |url: String| {
-        let mut request = http.get(url).bearer_auth(api_key);
-        if let Some(route) = &route {
-            request = request.header("X-Obscurify-TEE-Route", route);
-        }
-        request
-    };
-    // The receipt is written when the stream ends; it can take a moment to appear.
-    let mut receipt_json = None;
-    for attempt in 0..10 {
-        let r = get(format!("{base}/tee/receipts/{receipt_id}?model={model}"))
-            .send()
-            .await
-            .map_err(|e| format!("couldn't fetch the receipt: {e}"))?;
-        let code = r.status().as_u16();
-        let text = r.text().await.unwrap_or_default();
-        if code == 200 {
-            receipt_json = Some(text);
-            break;
-        }
-        if ![404, 502, 503].contains(&code) || attempt == 9 {
-            return Err(format!("receipt {receipt_id}: HTTP {code}: {text}"));
-        }
-        tokio::time::sleep(Duration::from_secs(2)).await;
-    }
-
-    let nonce = new_nonce();
-    let r = get(format!("{base}/tee/attestation?model={model}&nonce={nonce}"))
-        .send()
-        .await
-        .map_err(|e| format!("couldn't fetch the attestation: {e}"))?;
-    let code = r.status().as_u16();
-    let attestation_json = r.text().await.unwrap_or_default();
-    if code != 200 {
-        return Err(format!("attestation: HTTP {code}: {attestation_json}"));
-    }
-    Ok(Evidence {
-        body,
-        receipt_json: receipt_json.unwrap_or_default(),
-        attestation_json,
-        nonce,
-        request: None,
-    })
 }
 
 fn print_report(report: &Report) {

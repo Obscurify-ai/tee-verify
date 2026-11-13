@@ -1,6 +1,6 @@
 # obscurify-tee-verify
 
-Checks one reply from an Obscurify TEE model, and does the client side of Obscurify's Encrypted mode: end-to-end encryption between your device and the enclave. Obscurify's web chat and Android app use it for every Encrypted chat, and API users can do the same with the command-line tool or the library.
+The client side of Obscurify's Encrypted mode: end-to-end encryption between your device and the enclave that runs a TEE model, and the checks on each reply. Obscurify's web chat and Android app use it for every encrypted chat, and API users can do the same with the command-line tool or the library.
 
 TEE models on Obscurify are served through RedPill's private AI gateway, which runs in an Intel TDX confidential VM (dstack). For each reply the gateway signs a receipt with the hashes of what it received and what it sent back. This crate takes three things the client collected itself:
 
@@ -8,13 +8,13 @@ TEE models on Obscurify are served through RedPill's private AI gateway, which r
 - the receipt for that reply,
 - the gateway's attestation report, fetched with a random nonce the client just made,
 
-and runs seven checks on them.
+and runs eight checks on them (with the plain request it encrypted, see Encrypted mode below).
 
 ## The checks
 
 | Id | What it checks | What a pass means |
 |---|---|---|
-| `request_bytes` | Encrypted mode only: SHA-256 of the request you encrypted (in plain text, with Obscurify's model id swapped for the gateway's, which is the receipt's `model`) equals `request.received.body_hash`, which the gateway takes over the request after decrypting it | The enclave got exactly the conversation you wrote. Obscurify couldn't add, drop or change a message, even though anyone can encrypt to the gateway's public key. |
+| `request_bytes` | SHA-256 of the request you encrypted (in plain text, with Obscurify's model id swapped for the gateway's, which is the receipt's `model`) equals `request.received.body_hash`, which the gateway takes over the request after decrypting it | The enclave got exactly the conversation you wrote. Obscurify couldn't add, drop or change a message, even though anyone can encrypt to the gateway's public key. |
 | `reply_bytes` | SHA-256 of the reply equals `response.returned.body_hash` in the receipt | Nobody between the gateway and you changed or cut the reply. Obscurify's keepalive frames (`: obscurify-keepalive`), sent between SSE frames while a model is thinking, are removed first. |
 | `receipt_signature` | Ed25519 signature over the RFC 8785 canonical receipt, with the receipt key from the attested keyset | The receipt came from the holder of the gateway's receipt key. |
 | `nonce_binding` | The keyset hashes to the receipt's `workload_keyset_digest`, and the quote's report data is `sha256({"keyset_digest","nonce","purpose":"aci.report_data.v1"})` followed by 32 zero bytes | That key belongs to the machine that produced the quote, and the quote is fresh: it answers your nonce, so it can't be an old recording. |
@@ -29,7 +29,7 @@ A reply counts as verified when every check passes, except that `approved_releas
 
 The gateway's attested keyset also holds encryption keys (`e2ee_public_keys`). Encrypted mode uses the secp256k1 one (`secp256k1-aes-256-gcm-hkdf-sha256`):
 
-1. Before sending anything, fetch the attestation report with a fresh nonce (`GET /v1/tee/attestation?model=...&nonce=...` with `X-Obscurify-TEE-Route: e2ee`) and run `verify_attestation`. It runs checks 3 to 6 on the report alone and returns the encryption key only when they pass. Encrypt to no other key: a key that didn't come from a verified report could be anyone's, including Obscurify's.
+1. Before sending anything, fetch the attestation report with a fresh nonce (`GET /v1/tee/attestation?model=...&nonce=...`) and run `verify_attestation`. It runs checks 3 to 6 on the report alone and returns the encryption key only when they pass. Encrypt to no other key: a key that didn't come from a verified report could be anyone's, including Obscurify's.
 2. Make a key pair (`e2ee::Session`) and encrypt every message's `content` to the gateway's key (`encrypt_request`). Each encrypted string is hex of your 65-byte uncompressed public key, a 12-byte IV and the AES-256-GCM ciphertext with its tag. The AES key is HKDF-SHA256 of the ECDH shared point's x-coordinate, with no salt and info `ecdsa_encryption`.
 3. Send the body with `X-Client-Pub-Key` (yours), `X-Model-Pub-Key` (the gateway's) and `X-Signing-Algo: ecdsa`. Streams need `"stream_options": {"include_usage": true}`: token counts stay in plain text for billing. No tools, web search or held threads.
 4. Every `content`, `reasoning_content` or `reasoning` in the answer comes back as an encrypted string with a fresh sender key in its first 65 bytes. `decrypt_event` (one SSE event) and `decrypt_answer` (a JSON object) decrypt them with your session key, and fail if any came back unencrypted.
@@ -39,8 +39,7 @@ What Encrypted mode doesn't hide: which model you use, when, how long the messag
 
 ## What it doesn't prove
 
-- Without Encrypted mode, your text passes through Obscurify's server in the clear on its way to the gateway. Obscurify not logging it is a policy, not something this crate can check. In Encrypted mode only the gateway's enclave (and the model host it verified) can read it.
-- Without Encrypted mode the request side isn't checked: `request.received` covers the request as it reached the gateway, which isn't byte for byte what you sent.
+- It hides what you say, not that you said it: which model, when, how long the messages and answers are, the token counts and your account are visible to Obscurify.
 - The `model_host` check trusts the attested gateway's own verification of the model host. It doesn't fetch and appraise the host's GPU evidence itself.
 - `source_provenance` (repository and commit) is a label the workload declares. The measured values are the compose hash and the images it pins.
 - It doesn't check the OS image against a published list. The OS image hash is reported.
@@ -81,15 +80,12 @@ let sealed = session.encrypt_request(&key, r#"{"model":"tee/glm-5.3","stream":tr
 ```bash
 cargo install --path . --features cli
 
-# Ask a TEE model something with verification on, then check the reply
-OBSCURIFY_API_KEY=sk-obs1_... obscurify-tee-verify run --model tee/glm-5.3-flash --prompt "Hello"
-
 # Chat end to end encrypted: check the attestation, encrypt, decrypt the answer, check the receipt
 OBSCURIFY_API_KEY=sk-obs1_... obscurify-tee-verify chat --model tee/glm-5.3 --prompt "Hello"
 
-# Check a reply saved earlier (run --save DIR writes these four files)
+# Check a reply saved earlier (chat --save DIR writes these files)
 obscurify-tee-verify check --body body.sse --receipt receipt.json \
-  --attestation attestation.json --nonce "$(cat nonce.txt)"
+  --attestation attestation.json --nonce "$(cat nonce.txt)" --request request.json
 ```
 
 Add `--json` for the full report. Exit status: 0 verified, 1 not verified (for `chat`, also: the attestation didn't verify, so nothing was sent, or the answer came back unencrypted), 2 usage or network error.
@@ -124,7 +120,7 @@ cargo test --features cli                 # offline: tampering, keepalives, bad 
 cargo test --features cli -- --ignored    # also the live checks (PCCS and Base)
 ```
 
-The fixtures in `tests/fixtures` are one real streamed reply from `tee/glm-5.3-flash` with its receipt and an attestation fetched with the nonce in `nonce.txt`. Set `TEE_VERIFY_LIVE_DIR` to a directory written by `run --save` to run the command-line tests on a fresh reply.
+The fixtures in `tests/fixtures` are one real streamed reply from `tee/glm-5.3-flash` with its receipt and an attestation fetched with the nonce in `nonce.txt`. Set `TEE_VERIFY_LIVE_DIR` to a directory written by `chat --save` to run the command-line tests on a fresh reply.
 
 ## License
 
